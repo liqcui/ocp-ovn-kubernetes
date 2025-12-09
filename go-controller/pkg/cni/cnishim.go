@@ -192,27 +192,28 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 	klog.Infof("[CNI-DEBUG] CmdAdd process started: PID=%d, ContainerID=%s, Time=%s",
 		pid, args.ContainerID, processStartTime.Format(time.RFC3339Nano))
 
-	// Acquire system-wide lock to prevent excessive concurrent CNI operations
+	// Acquire semaphore slot to limit concurrent CNI operations (max 250)
 	// This prevents resource exhaustion (threads, goroutines, file descriptors)
+	// while allowing good parallelism for pod creation throughput
 	lockAcquireStart := time.Now()
-	klog.Infof("[CNI-DEBUG] Attempting to acquire lock: PID=%d, Time=%s",
+	klog.Infof("[CNI-DEBUG] Attempting to acquire semaphore slot: PID=%d, Time=%s",
 		pid, lockAcquireStart.Format(time.RFC3339Nano))
 
 	lock, err := AcquireCNILock()
 	if err != nil {
-		return fmt.Errorf("failed to acquire CNI lock: %v", err)
+		return fmt.Errorf("failed to acquire CNI semaphore slot: %v", err)
 	}
 
 	lockAcquireEnd := time.Now()
 	lockWaitDuration := lockAcquireEnd.Sub(lockAcquireStart)
-	klog.Infof("[CNI-DEBUG] Lock acquired: PID=%d, WaitTime=%v, Time=%s",
+	klog.Infof("[CNI-DEBUG] Semaphore slot acquired: PID=%d, WaitTime=%v, Time=%s",
 		pid, lockWaitDuration, lockAcquireEnd.Format(time.RFC3339Nano))
 
 	defer func() {
 		if releaseErr := lock.Release(); releaseErr != nil {
-			klog.Warningf("failed to release CNI lock: %v", releaseErr)
+			klog.Warningf("failed to release CNI semaphore slot: %v", releaseErr)
 		}
-		klog.Infof("[CNI-DEBUG] Lock released: PID=%d, Time=%s",
+		klog.Infof("[CNI-DEBUG] Semaphore slot released: PID=%d, Time=%s",
 			pid, time.Now().Format(time.RFC3339Nano))
 
 		// Log total process execution time
@@ -340,26 +341,26 @@ func (p *Plugin) CmdDel(args *skel.CmdArgs) error {
 	klog.Infof("[CNI-DEBUG] CmdDel process started: PID=%d, ContainerID=%s, Time=%s",
 		pid, args.ContainerID, processStartTime.Format(time.RFC3339Nano))
 
-	// Acquire system-wide lock to prevent excessive concurrent CNI operations
+	// Acquire semaphore slot to limit concurrent CNI operations (max 250)
 	lockAcquireStart := time.Now()
-	klog.Infof("[CNI-DEBUG] Attempting to acquire lock: PID=%d, Time=%s",
+	klog.Infof("[CNI-DEBUG] Attempting to acquire semaphore slot: PID=%d, Time=%s",
 		pid, lockAcquireStart.Format(time.RFC3339Nano))
 
 	lock, err := AcquireCNILock()
 	if err != nil {
-		return fmt.Errorf("failed to acquire CNI lock: %v", err)
+		return fmt.Errorf("failed to acquire CNI semaphore slot: %v", err)
 	}
 
 	lockAcquireEnd := time.Now()
 	lockWaitDuration := lockAcquireEnd.Sub(lockAcquireStart)
-	klog.Infof("[CNI-DEBUG] Lock acquired: PID=%d, WaitTime=%v, Time=%s",
+	klog.Infof("[CNI-DEBUG] Semaphore slot acquired: PID=%d, WaitTime=%v, Time=%s",
 		pid, lockWaitDuration, lockAcquireEnd.Format(time.RFC3339Nano))
 
 	defer func() {
 		if releaseErr := lock.Release(); releaseErr != nil {
-			klog.Warningf("failed to release CNI lock: %v", releaseErr)
+			klog.Warningf("failed to release CNI semaphore slot: %v", releaseErr)
 		}
-		klog.Infof("[CNI-DEBUG] Lock released: PID=%d, Time=%s",
+		klog.Infof("[CNI-DEBUG] Semaphore slot released: PID=%d, Time=%s",
 			pid, time.Now().Format(time.RFC3339Nano))
 
 		// Log total process execution time
