@@ -32,6 +32,35 @@ type CNILock struct {
 	slotNum  int
 }
 
+// countActiveSlots returns the number of currently locked slots
+// This is used for debugging to show current concurrency level
+// TODO(debug): Remove after debugging is complete
+func countActiveSlots() int {
+	count := 0
+	for slotNum := 0; slotNum < MaxConcurrentCNI; slotNum++ {
+		slotPath := filepath.Join(LockDir, fmt.Sprintf("slot-%03d.lock", slotNum))
+
+		// Try to open the slot file
+		f, err := os.OpenFile(slotPath, os.O_RDONLY, 0644)
+		if err != nil {
+			// File doesn't exist yet, skip
+			continue
+		}
+
+		// Try non-blocking lock to check if it's in use
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == syscall.EWOULDBLOCK {
+			// Slot is locked (in use)
+			count++
+		} else if err == nil {
+			// We got the lock, release it immediately
+			syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		}
+		f.Close()
+	}
+	return count
+}
+
 // AcquireCNILock acquires one of the available semaphore slots for CNI operations
 // This ensures controlled concurrency (max 250 concurrent) across all CNI processes
 // TODO(debug): Remove detailed logging after debugging is complete
@@ -69,8 +98,9 @@ func AcquireCNILock() (*CNILock, error) {
 			if err == nil {
 				// Successfully acquired this slot
 				acquireTime := time.Since(startTime)
-				klog.Infof("[CNI-DEBUG] Semaphore slot acquired: PID=%d, Slot=%d, WaitTime=%v, Retries=%d, Time=%s",
-					pid, slotNum, acquireTime, retryCount, time.Now().Format(time.RFC3339Nano))
+				activeSlots := countActiveSlots()
+				klog.Infof("[CNI-DEBUG] Semaphore slot acquired: PID=%d, Slot=%d, ActiveSlots=%d/%d, WaitTime=%v, Retries=%d, Time=%s",
+					pid, slotNum, activeSlots, MaxConcurrentCNI, acquireTime, retryCount, time.Now().Format(time.RFC3339Nano))
 
 				return &CNILock{
 					file:     f,
@@ -92,8 +122,9 @@ func AcquireCNILock() (*CNILock, error) {
 		if retryCount == 1 || retryCount%100 == 0 {
 			// Log every 100th retry (every 1 second)
 			waitTime := time.Since(startTime)
-			klog.V(4).Infof("[CNI-DEBUG] All %d semaphore slots busy: PID=%d, WaitTime=%v, Retries=%d",
-				MaxConcurrentCNI, pid, waitTime, retryCount)
+			activeSlots := countActiveSlots()
+			klog.V(4).Infof("[CNI-DEBUG] All %d semaphore slots busy: PID=%d, ActiveSlots=%d/%d, WaitTime=%v, Retries=%d",
+				MaxConcurrentCNI, pid, activeSlots, MaxConcurrentCNI, waitTime, retryCount)
 		}
 
 		// Wait before retrying
@@ -131,8 +162,9 @@ func (l *CNILock) Release() error {
 		return err
 	}
 
-	klog.V(4).Infof("[CNI-DEBUG] Semaphore slot released: PID=%d, Slot=%d, Path=%s, Time=%s",
-		pid, l.slotNum, l.slotPath, time.Now().Format(time.RFC3339Nano))
+	activeSlots := countActiveSlots()
+	klog.V(4).Infof("[CNI-DEBUG] Semaphore slot released: PID=%d, Slot=%d, ActiveSlots=%d/%d, Path=%s, Time=%s",
+		pid, l.slotNum, activeSlots, MaxConcurrentCNI, l.slotPath, time.Now().Format(time.RFC3339Nano))
 	l.file = nil
 
 	return nil
