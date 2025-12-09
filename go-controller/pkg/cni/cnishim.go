@@ -184,18 +184,52 @@ func (c *shimClientset) getPod(namespace, name string) (*corev1.Pod, error) {
 
 // CmdAdd is the callback for 'add' cni calls from skel
 func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
-	var err error
+	var processStartTime time.Time
+	var pid int
+
+	// Only track timing if debug logging enabled (avoid time.Now() overhead)
+	if EnableDebugLogging {
+		processStartTime = time.Now()
+		pid = os.Getpid()
+		klog.V(4).Infof("[CNI-DEBUG] CmdAdd process started: PID=%d, ContainerID=%s",
+			pid, args.ContainerID)
+	}
+
+	// Acquire semaphore slot to limit concurrent CNI operations (max 300)
+	// This prevents resource exhaustion (threads, goroutines, file descriptors)
+	// while allowing good parallelism for pod creation throughput
+	// Note: AcquireCNILock() has its own conditional logging
+	lock, err := AcquireCNILock()
+	if err != nil {
+		return fmt.Errorf("failed to acquire CNI semaphore slot: %v", err)
+	}
+
+	defer func() {
+		if releaseErr := lock.Release(); releaseErr != nil {
+			// Tier 1: Always log errors
+			klog.Warningf("[CNI-ERROR] Failed to release semaphore slot: %v", releaseErr)
+		}
+
+		// Tier 3: Only log completion if debug logging enabled
+		if EnableDebugLogging {
+			totalDuration := time.Since(processStartTime)
+			klog.V(4).Infof("[CNI-DEBUG] CmdAdd process completed: PID=%d, ContainerID=%s, TotalTime=%v",
+				pid, args.ContainerID, totalDuration)
+		}
+	}()
+
+	var cmdErr error
 
 	startTime := time.Now()
 	defer func() {
-		p.postMetrics(startTime, CNIAdd, err)
+		p.postMetrics(startTime, CNIAdd, cmdErr)
 	}()
 
 	// read the config stdin args to obtain cniVersion
 	conf, errC := config.ReadCNIConfig(args.StdinData)
 	if errC != nil {
-		err = fmt.Errorf("invalid stdin args %v", errC)
-		return err
+		cmdErr = fmt.Errorf("invalid stdin args %v", errC)
+		return cmdErr
 	}
 	setupLogging(conf)
 
@@ -203,33 +237,44 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 	if len(conf.RuntimeConfig.CNIDeviceInfoFile) != 0 {
 		bytes, err := os.ReadFile(conf.RuntimeConfig.CNIDeviceInfoFile)
 		if err != nil {
-			return err
+			cmdErr = err
+			return cmdErr
 		}
 		if err := json.Unmarshal(bytes, &deviceInfo); err != nil {
-			return err
+			cmdErr = err
+			return cmdErr
 		}
 	}
 
 	req := newCNIRequest(args, deviceInfo)
 
+	// Tier 3: Only log CNI server communication if debug logging enabled
+	if EnableDebugLogging {
+		klog.V(4).Infof("[CNI-DEBUG] Calling CNI server: PID=%d", pid)
+	}
+
 	body, errB := p.doCNIFunc("http://dummy/", req)
+
+	if EnableDebugLogging {
+		klog.V(4).Infof("[CNI-DEBUG] CNI server response received: PID=%d", pid)
+	}
 	if errB != nil {
-		err = errB
-		klog.Error(err.Error())
-		return err
+		cmdErr = errB
+		klog.Error(cmdErr.Error())
+		return cmdErr
 	}
 
 	response := &Response{}
-	if err = json.Unmarshal(body, response); err != nil {
-		err = fmt.Errorf("failed to unmarshal response '%s': %v", string(body), err)
-		klog.Error(err.Error())
-		return err
+	if cmdErr = json.Unmarshal(body, response); cmdErr != nil {
+		cmdErr = fmt.Errorf("failed to unmarshal response '%s': %v", string(body), cmdErr)
+		klog.Error(cmdErr.Error())
+		return cmdErr
 	}
 
 	clientset, errK := shimClientsetFromConfig(response.KubeAuth)
 	if errK != nil {
-		err = errK
-		return err
+		cmdErr = errK
+		return cmdErr
 	}
 
 	var result *current.Result
@@ -243,36 +288,36 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 		// Use the IPAM details from ovnkube-node to configure the pod interface
 		pr, err := cniRequestToPodRequest(req)
 		if err != nil {
-			err = fmt.Errorf("failed to create pod request: %v", err)
-			klog.Error(err.Error())
-			return err
+			cmdErr = fmt.Errorf("failed to create pod request: %v", err)
+			klog.Error(cmdErr.Error())
+			return cmdErr
 		}
 		defer pr.cancel()
 
 		if !response.PodIFInfo.IsDPUHostMode {
 			// Initialize OVS exec runner; find OVS binaries that the CNI code uses.
 			if err := SetExec(kexec.New()); err != nil {
-				err = fmt.Errorf("failed to initialize OVS exec runner: %v", err)
-				klog.Error(err.Error())
-				return err
+				cmdErr = fmt.Errorf("failed to initialize OVS exec runner: %v", err)
+				klog.Error(cmdErr.Error())
+				return cmdErr
 			}
 		}
 
 		// In the case where ovnkube-node is running in Unprivileged mode, all the work
-		result, err = getCNIResult(pr, clientset, response.PodIFInfo)
-		if err != nil {
-			err = fmt.Errorf("failed to get CNI Result from pod interface info %v: %v", response.PodIFInfo, err)
-			klog.Error(err.Error())
-			return err
+		result, cmdErr = getCNIResult(pr, clientset, response.PodIFInfo)
+		if cmdErr != nil {
+			cmdErr = fmt.Errorf("failed to get CNI Result from pod interface info %v: %v", response.PodIFInfo, cmdErr)
+			klog.Error(cmdErr.Error())
+			return cmdErr
 		}
 		if response.PrimaryUDNPodInfo != nil {
 			primaryUDNPodRequest := response.PrimaryUDNPodReq
 			primaryUDNPodRequest.ctx, primaryUDNPodRequest.cancel = context.WithCancel(pr.ctx)
 			defer primaryUDNPodRequest.cancel()
-			err = primaryUDNCmdAddGetCNIResultFunc(result, getCNIResult, primaryUDNPodRequest, clientset, response.PrimaryUDNPodInfo)
-			if err != nil {
-				klog.Error(err.Error())
-				return err
+			cmdErr = primaryUDNCmdAddGetCNIResultFunc(result, getCNIResult, primaryUDNPodRequest, clientset, response.PrimaryUDNPodInfo)
+			if cmdErr != nil {
+				klog.Error(cmdErr.Error())
+				return cmdErr
 			}
 		}
 	}
@@ -282,61 +327,93 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 
 // CmdDel is the callback for 'teardown' cni calls from skel
 func (p *Plugin) CmdDel(args *skel.CmdArgs) error {
-	var err error
+	var processStartTime time.Time
+	var pid int
+
+	// Only track timing if debug logging enabled (avoid time.Now() overhead)
+	if EnableDebugLogging {
+		processStartTime = time.Now()
+		pid = os.Getpid()
+		klog.V(4).Infof("[CNI-DEBUG] CmdDel process started: PID=%d, ContainerID=%s",
+			pid, args.ContainerID)
+	}
+
+	// Acquire semaphore slot to limit concurrent CNI operations (max 300)
+	// Note: AcquireCNILock() has its own conditional logging
+	lock, err := AcquireCNILock()
+	if err != nil {
+		return fmt.Errorf("failed to acquire CNI semaphore slot: %v", err)
+	}
+
+	defer func() {
+		if releaseErr := lock.Release(); releaseErr != nil {
+			// Tier 1: Always log errors
+			klog.Warningf("[CNI-ERROR] Failed to release semaphore slot: %v", releaseErr)
+		}
+
+		// Tier 3: Only log completion if debug logging enabled
+		if EnableDebugLogging {
+			totalDuration := time.Since(processStartTime)
+			klog.V(4).Infof("[CNI-DEBUG] CmdDel process completed: PID=%d, ContainerID=%s, TotalTime=%v",
+				pid, args.ContainerID, totalDuration)
+		}
+	}()
+
+	var cmdErr error
 	var body []byte
 	var pr *PodRequest
 	var conf *ovntypes.NetConf
 
 	startTime := time.Now()
 	defer func() {
-		p.postMetrics(startTime, CNIDel, err)
-		if err != nil {
-			klog.Errorf("Error on CmdDel: %v", err)
+		p.postMetrics(startTime, CNIDel, cmdErr)
+		if cmdErr != nil {
+			klog.Errorf("Error on CmdDel: %v", cmdErr)
 		}
 	}()
 
 	// read the config stdin args
-	conf, err = config.ReadCNIConfig(args.StdinData)
-	if err != nil {
-		return err
+	conf, cmdErr = config.ReadCNIConfig(args.StdinData)
+	if cmdErr != nil {
+		return cmdErr
 	}
 	setupLogging(conf)
 
 	var deviceInfo = nadapi.DeviceInfo{}
 	req := newCNIRequest(args, deviceInfo)
-	body, err = p.doCNIFunc("http://dummy/", req)
-	if err != nil {
-		return err
+	body, cmdErr = p.doCNIFunc("http://dummy/", req)
+	if cmdErr != nil {
+		return cmdErr
 	}
 
 	response := &Response{}
-	err = json.Unmarshal(body, response)
-	if err != nil {
-		err = fmt.Errorf("failed to unmarshal response '%s': %v", string(body), err)
-		return err
+	cmdErr = json.Unmarshal(body, response)
+	if cmdErr != nil {
+		cmdErr = fmt.Errorf("failed to unmarshal response '%s': %v", string(body), cmdErr)
+		return cmdErr
 	}
 
 	// if Result is nil, then ovnkube-node is running in unprivileged mode so unconfigure the Interface from here.
 	if response.Result == nil {
-		pr, err = cniRequestToPodRequest(req)
-		if err != nil {
-			err = fmt.Errorf("failed to create pod request: %v", err)
-			return err
+		pr, cmdErr = cniRequestToPodRequest(req)
+		if cmdErr != nil {
+			cmdErr = fmt.Errorf("failed to create pod request: %v", cmdErr)
+			return cmdErr
 		}
 		defer pr.cancel()
 
 		if !response.PodIFInfo.IsDPUHostMode {
 			// Initialize OVS exec runner; find OVS binaries that the CNI code uses.
 			if err := SetExec(kexec.New()); err != nil {
-				err = fmt.Errorf("failed to initialize OVS exec runner: %v", err)
-				klog.Error(err.Error())
-				return err
+				cmdErr = fmt.Errorf("failed to initialize OVS exec runner: %v", err)
+				klog.Error(cmdErr.Error())
+				return cmdErr
 			}
 		}
 
-		err = podRequestInterfaceOps.UnconfigureInterface(pr, response.PodIFInfo)
+		cmdErr = podRequestInterfaceOps.UnconfigureInterface(pr, response.PodIFInfo)
 	}
-	return err
+	return cmdErr
 }
 
 // CmdCheck is the callback for 'checking' container's networking is as expected.

@@ -203,4 +203,12 @@ type Server struct {
 	kubeAuth             *KubeAPIAuth
 	networkManager       networkmanager.Interface
 	ovsClient            client.Client
+
+	// Performance optimization: limit concurrent server operations
+	// This provides server-side protection even when all client slots are occupied
+	requestSemaphore chan struct{}
+
+	// Performance optimization: cache pod annotations to reduce K8s API calls
+	// Reduces API load during pod creation bursts
+	podCache *PodCache
 }

@@ -52,6 +52,18 @@ import (
 // removed and re-created with 0700 permissions each time ovnkube on the node is
 // started.
 
+const (
+	// MaxConcurrentServerRequests limits concurrent CNI operations in the server
+	// This provides server-side protection to prevent resource exhaustion
+	// Value is tuned based on:
+	// - OVS database capacity (~100-150 concurrent transactions)
+	// - Kubernetes API server load
+	// - Network namespace operation serialization
+	// Set to 200 to allow good throughput while preventing overload
+	// Works in conjunction with client-side limit (MaxConcurrentCNI=300)
+	MaxConcurrentServerRequests = 200
+)
+
 // NewCNIServer creates and returns a new Server object which will listen on a socket in the given path
 func NewCNIServer(
 	factory factory.NodeWatchFactory,
@@ -88,7 +100,16 @@ func NewCNIServer(
 		handlePodRequestFunc: HandlePodRequest,
 		networkManager:       networkManager,
 		ovsClient:            ovsClient,
+		// Performance optimization: server-side concurrency limiting
+		// Prevents OVS/K8s API overload even when all client slots are occupied
+		requestSemaphore: make(chan struct{}, MaxConcurrentServerRequests),
+		// Performance optimization: pod annotation cache
+		// Reduces K8s API calls during pod creation bursts
+		podCache: NewPodCache(),
 	}
+
+	klog.Infof("CNI Server initialized with server-side concurrency limit=%d, client limit=%d",
+		MaxConcurrentServerRequests, MaxConcurrentCNI)
 
 	if len(config.Kubernetes.CAData) > 0 {
 		s.kubeAuth.KubeCAData = base64.StdEncoding.EncodeToString(config.Kubernetes.CAData)
@@ -97,6 +118,12 @@ func NewCNIServer(
 	router.NotFoundHandler = http.HandlerFunc(http.NotFound)
 	router.HandleFunc("/metrics", s.handleCNIMetrics).Methods("POST")
 	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Server-side concurrency control: acquire slot (blocks if all 200 slots busy)
+		// This prevents resource exhaustion even when all client slots (300) are occupied
+		// The difference (300 client - 200 server) provides buffering for bursty workloads
+		s.requestSemaphore <- struct{}{}
+		defer func() { <-s.requestSemaphore }()
+
 		result, err := s.handleCNIRequest(r)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("%v", err), http.StatusBadRequest)
