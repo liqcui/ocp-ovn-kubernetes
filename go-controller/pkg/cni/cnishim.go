@@ -209,13 +209,11 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 		pid, lockWaitDuration, lockAcquireEnd.Format(time.RFC3339Nano))
 
 	defer func() {
-		lockReleaseStart := time.Now()
 		if releaseErr := lock.Release(); releaseErr != nil {
 			klog.Warningf("failed to release CNI lock: %v", releaseErr)
 		}
-		lockReleaseEnd := time.Now()
 		klog.Infof("[CNI-DEBUG] Lock released: PID=%d, Time=%s",
-			pid, lockReleaseEnd.Format(time.RFC3339Nano))
+			pid, time.Now().Format(time.RFC3339Nano))
 
 		// Log total process execution time
 		processEndTime := time.Now()
@@ -358,13 +356,11 @@ func (p *Plugin) CmdDel(args *skel.CmdArgs) error {
 		pid, lockWaitDuration, lockAcquireEnd.Format(time.RFC3339Nano))
 
 	defer func() {
-		lockReleaseStart := time.Now()
 		if releaseErr := lock.Release(); releaseErr != nil {
 			klog.Warningf("failed to release CNI lock: %v", releaseErr)
 		}
-		lockReleaseEnd := time.Now()
 		klog.Infof("[CNI-DEBUG] Lock released: PID=%d, Time=%s",
-			pid, lockReleaseEnd.Format(time.RFC3339Nano))
+			pid, time.Now().Format(time.RFC3339Nano))
 
 		// Log total process execution time
 		processEndTime := time.Now()
