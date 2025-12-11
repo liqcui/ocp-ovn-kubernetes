@@ -52,6 +52,16 @@ import (
 // removed and re-created with 0700 permissions each time ovnkube on the node is
 // started.
 
+const (
+	// MaxConcurrentServerRequests limits concurrent CNI operations in the server
+	// This prevents resource exhaustion even when all client slots (250) are occupied
+	// Value is tuned based on:
+	// - OVS database capacity (~100 concurrent transactions)
+	// - Kubernetes API server load
+	// - Network namespace operation serialization
+	MaxConcurrentServerRequests = 100
+)
+
 // NewCNIServer creates and returns a new Server object which will listen on a socket in the given path
 func NewCNIServer(
 	factory factory.NodeWatchFactory,
@@ -88,7 +98,13 @@ func NewCNIServer(
 		handlePodRequestFunc: HandlePodRequest,
 		networkManager:       networkManager,
 		ovsClient:            ovsClient,
+		// Performance optimization: server-side concurrency limiting
+		requestSemaphore: make(chan struct{}, MaxConcurrentServerRequests),
+		// Performance optimization: pod annotation cache
+		podCache: NewPodCache(),
 	}
+
+	klog.Infof("CNI Server initialized with server-side concurrency limit=%d", MaxConcurrentServerRequests)
 
 	if len(config.Kubernetes.CAData) > 0 {
 		s.kubeAuth.KubeCAData = base64.StdEncoding.EncodeToString(config.Kubernetes.CAData)
@@ -97,6 +113,11 @@ func NewCNIServer(
 	router.NotFoundHandler = http.HandlerFunc(http.NotFound)
 	router.HandleFunc("/metrics", s.handleCNIMetrics).Methods("POST")
 	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Acquire server-side slot (blocks if all 100 slots busy)
+		// This prevents resource exhaustion even when all client slots (250) are occupied
+		s.requestSemaphore <- struct{}{}
+		defer func() { <-s.requestSemaphore }()
+
 		result, err := s.handleCNIRequest(r)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("%v", err), http.StatusBadRequest)

@@ -15,8 +15,9 @@ const (
 	LockDir = "/var/run/ovn-kubernetes/cni"
 
 	// MaxConcurrentCNI is the maximum number of concurrent CNI operations
-	// This limit prevents thread pool exhaustion while allowing good parallelism
-	MaxConcurrentCNI = 250
+	// Reduced from 250 to 100 to balance with server capacity (MaxConcurrentServerRequests=100)
+	// This prevents queue buildup and reduces resource contention
+	MaxConcurrentCNI = 100
 
 	// LockTimeout is how long to wait for lock acquisition
 	LockTimeout = 60 * time.Second
