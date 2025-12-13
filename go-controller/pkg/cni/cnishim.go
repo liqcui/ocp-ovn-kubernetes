@@ -184,45 +184,38 @@ func (c *shimClientset) getPod(namespace, name string) (*corev1.Pod, error) {
 
 // CmdAdd is the callback for 'add' cni calls from skel
 func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
-	// TODO(debug): Remove detailed logging after debugging is complete
-	processStartTime := time.Now()
-	pid := os.Getpid()
+	var processStartTime time.Time
+	var pid int
 
-	// Log process start with timestamp
-	klog.Infof("[CNI-DEBUG] CmdAdd process started: PID=%d, ContainerID=%s, Time=%s",
-		pid, args.ContainerID, processStartTime.Format(time.RFC3339Nano))
+	// Only track timing if debug logging enabled (avoid time.Now() overhead)
+	if EnableDebugLogging {
+		processStartTime = time.Now()
+		pid = os.Getpid()
+		klog.V(4).Infof("[CNI-DEBUG] CmdAdd process started: PID=%d, ContainerID=%s",
+			pid, args.ContainerID)
+	}
 
-	// Acquire semaphore slot to limit concurrent CNI operations (max 250)
+	// Acquire semaphore slot to limit concurrent CNI operations (max 300)
 	// This prevents resource exhaustion (threads, goroutines, file descriptors)
 	// while allowing good parallelism for pod creation throughput
-	lockAcquireStart := time.Now()
-	klog.Infof("[CNI-DEBUG] Attempting to acquire semaphore slot: PID=%d, Time=%s",
-		pid, lockAcquireStart.Format(time.RFC3339Nano))
-
+	// Note: AcquireCNILock() has its own conditional logging
 	lock, err := AcquireCNILock()
 	if err != nil {
 		return fmt.Errorf("failed to acquire CNI semaphore slot: %v", err)
 	}
 
-	lockAcquireEnd := time.Now()
-	lockWaitDuration := lockAcquireEnd.Sub(lockAcquireStart)
-	klog.Infof("[CNI-DEBUG] Semaphore slot acquired: PID=%d, WaitTime=%v, Time=%s",
-		pid, lockWaitDuration, lockAcquireEnd.Format(time.RFC3339Nano))
-
 	defer func() {
 		if releaseErr := lock.Release(); releaseErr != nil {
-			klog.Warningf("failed to release CNI semaphore slot: %v", releaseErr)
+			// Tier 1: Always log errors
+			klog.Warningf("[CNI-ERROR] Failed to release semaphore slot: %v", releaseErr)
 		}
-		klog.Infof("[CNI-DEBUG] Semaphore slot released: PID=%d, Time=%s",
-			pid, time.Now().Format(time.RFC3339Nano))
 
-		// Log total process execution time
-		processEndTime := time.Now()
-		totalDuration := processEndTime.Sub(processStartTime)
-		klog.Infof("[CNI-DEBUG] CmdAdd process completed: PID=%d, ContainerID=%s, TotalTime=%v, StartTime=%s, EndTime=%s",
-			pid, args.ContainerID, totalDuration,
-			processStartTime.Format(time.RFC3339Nano),
-			processEndTime.Format(time.RFC3339Nano))
+		// Tier 3: Only log completion if debug logging enabled
+		if EnableDebugLogging {
+			totalDuration := time.Since(processStartTime)
+			klog.V(4).Infof("[CNI-DEBUG] CmdAdd process completed: PID=%d, ContainerID=%s, TotalTime=%v",
+				pid, args.ContainerID, totalDuration)
+		}
 	}()
 
 	var cmdErr error
@@ -255,15 +248,16 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 
 	req := newCNIRequest(args, deviceInfo)
 
-	// TODO(debug): Log CNI server communication timing
-	cniServerStart := time.Now()
-	klog.V(4).Infof("[CNI-DEBUG] Calling CNI server: PID=%d", pid)
+	// Tier 3: Only log CNI server communication if debug logging enabled
+	if EnableDebugLogging {
+		klog.V(4).Infof("[CNI-DEBUG] Calling CNI server: PID=%d", pid)
+	}
 
 	body, errB := p.doCNIFunc("http://dummy/", req)
 
-	cniServerEnd := time.Now()
-	cniServerDuration := cniServerEnd.Sub(cniServerStart)
-	klog.V(4).Infof("[CNI-DEBUG] CNI server response received: PID=%d, Duration=%v", pid, cniServerDuration)
+	if EnableDebugLogging {
+		klog.V(4).Infof("[CNI-DEBUG] CNI server response received: PID=%d", pid)
+	}
 	if errB != nil {
 		cmdErr = errB
 		klog.Error(cmdErr.Error())
@@ -333,43 +327,36 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 
 // CmdDel is the callback for 'teardown' cni calls from skel
 func (p *Plugin) CmdDel(args *skel.CmdArgs) error {
-	// TODO(debug): Remove detailed logging after debugging is complete
-	processStartTime := time.Now()
-	pid := os.Getpid()
+	var processStartTime time.Time
+	var pid int
 
-	// Log process start with timestamp
-	klog.Infof("[CNI-DEBUG] CmdDel process started: PID=%d, ContainerID=%s, Time=%s",
-		pid, args.ContainerID, processStartTime.Format(time.RFC3339Nano))
+	// Only track timing if debug logging enabled (avoid time.Now() overhead)
+	if EnableDebugLogging {
+		processStartTime = time.Now()
+		pid = os.Getpid()
+		klog.V(4).Infof("[CNI-DEBUG] CmdDel process started: PID=%d, ContainerID=%s",
+			pid, args.ContainerID)
+	}
 
-	// Acquire semaphore slot to limit concurrent CNI operations (max 250)
-	lockAcquireStart := time.Now()
-	klog.Infof("[CNI-DEBUG] Attempting to acquire semaphore slot: PID=%d, Time=%s",
-		pid, lockAcquireStart.Format(time.RFC3339Nano))
-
+	// Acquire semaphore slot to limit concurrent CNI operations (max 300)
+	// Note: AcquireCNILock() has its own conditional logging
 	lock, err := AcquireCNILock()
 	if err != nil {
 		return fmt.Errorf("failed to acquire CNI semaphore slot: %v", err)
 	}
 
-	lockAcquireEnd := time.Now()
-	lockWaitDuration := lockAcquireEnd.Sub(lockAcquireStart)
-	klog.Infof("[CNI-DEBUG] Semaphore slot acquired: PID=%d, WaitTime=%v, Time=%s",
-		pid, lockWaitDuration, lockAcquireEnd.Format(time.RFC3339Nano))
-
 	defer func() {
 		if releaseErr := lock.Release(); releaseErr != nil {
-			klog.Warningf("failed to release CNI semaphore slot: %v", releaseErr)
+			// Tier 1: Always log errors
+			klog.Warningf("[CNI-ERROR] Failed to release semaphore slot: %v", releaseErr)
 		}
-		klog.Infof("[CNI-DEBUG] Semaphore slot released: PID=%d, Time=%s",
-			pid, time.Now().Format(time.RFC3339Nano))
 
-		// Log total process execution time
-		processEndTime := time.Now()
-		totalDuration := processEndTime.Sub(processStartTime)
-		klog.Infof("[CNI-DEBUG] CmdDel process completed: PID=%d, ContainerID=%s, TotalTime=%v, StartTime=%s, EndTime=%s",
-			pid, args.ContainerID, totalDuration,
-			processStartTime.Format(time.RFC3339Nano),
-			processEndTime.Format(time.RFC3339Nano))
+		// Tier 3: Only log completion if debug logging enabled
+		if EnableDebugLogging {
+			totalDuration := time.Since(processStartTime)
+			klog.V(4).Infof("[CNI-DEBUG] CmdDel process completed: PID=%d, ContainerID=%s, TotalTime=%v",
+				pid, args.ContainerID, totalDuration)
+		}
 	}()
 
 	var cmdErr error

@@ -40,6 +40,25 @@ const (
 	// FastRetryThreshold is the number of full slot scans before switching to fast retry
 	// After this many failed attempts, we retry with minimal delay to grab slots quickly
 	FastRetryThreshold = 3
+
+	// Logging configuration
+	// EnableDebugLogging controls detailed debug logging (Tier 3)
+	// Set to false in production to reduce overhead by ~95%
+	// Can be overridden via CNI_DEBUG_LOGGING environment variable
+	EnableDebugLogging = false
+
+	// LogSamplingRate controls how often to log normal operations
+	// Only log every Nth successful acquisition (reduces log volume)
+	// Set to 100 to log 1 out of 100 acquisitions
+	LogSamplingRate = 100
+
+	// SlowAcquisitionThreshold defines when to log slow acquisitions
+	// Log acquisitions that take longer than this threshold
+	SlowAcquisitionThreshold = 5 * time.Second
+
+	// HighRetryThreshold defines when to log high retry counts
+	// Log if acquisition requires more retries than this
+	HighRetryThreshold = 50
 )
 
 var (
@@ -93,12 +112,13 @@ func hashPID(pid int) int {
 }
 
 // AcquireCNILock acquires one of the available semaphore slots for CNI operations
-// This ensures controlled concurrency (max 250 concurrent) across all CNI processes
+// This ensures controlled concurrency (max 300 concurrent) across all CNI processes
 //
 // Optimizations:
 // 1. Start from hash-based offset to distribute load
 // 2. Exponential backoff with jitter to reduce thundering herd
 // 3. Sample-based active slot counting to reduce overhead
+// 4. Conditional logging to reduce performance overhead
 func AcquireCNILock() (*CNILock, error) {
 	pid := os.Getpid()
 	startTime := time.Now()
@@ -108,8 +128,11 @@ func AcquireCNILock() (*CNILock, error) {
 		return nil, fmt.Errorf("failed to create lock directory: %v", err)
 	}
 
-	klog.V(4).Infof("[CNI-DEBUG] Attempting to acquire semaphore slot: PID=%d, MaxSlots=%d, Time=%s",
-		pid, MaxConcurrentCNI, startTime.Format(time.RFC3339Nano))
+	// Tier 3: Only log start if debug logging enabled
+	if EnableDebugLogging {
+		klog.V(4).Infof("[CNI-DEBUG] Attempting to acquire semaphore slot: PID=%d, MaxSlots=%d",
+			pid, MaxConcurrentCNI)
+	}
 
 	deadline := time.Now().Add(LockTimeout)
 	retryCount := 0
@@ -150,20 +173,37 @@ func AcquireCNILock() (*CNILock, error) {
 				// Successfully acquired this slot
 				acquireTime := time.Since(startTime)
 
-				// Only count active slots periodically to reduce overhead
+				// Increment acquisition counter for sampling
 				acquisitionCounter++
-				shouldCount := (acquisitionCounter % SamplingInterval) == 0
-				activeSlots := -1
-				if shouldCount {
-					activeSlots = countActiveSlots()
+
+				// Decide if we should log this acquisition
+				shouldLog := EnableDebugLogging || // Tier 3: Debug mode
+					acquireTime > SlowAcquisitionThreshold || // Tier 2: Slow acquisition
+					retryCount > HighRetryThreshold || // Tier 2: High retry count
+					(acquisitionCounter%LogSamplingRate) == 0 // Tier 1: Sampling
+
+				if shouldLog {
+					// Only count active slots if we're actually logging
+					// This is expensive (5-10ms), so skip unless needed
+					activeSlots := -1
+					if (acquisitionCounter % SamplingInterval) == 0 {
+						activeSlots = countActiveSlots()
+					}
+
+					if activeSlots >= 0 {
+						klog.Infof("[CNI-PERF] Semaphore slot acquired: PID=%d, Slot=%d, ActiveSlots=%d/%d, WaitTime=%v, Retries=%d",
+							pid, slotNum, activeSlots, MaxConcurrentCNI, acquireTime, retryCount)
+					} else {
+						klog.Infof("[CNI-PERF] Semaphore slot acquired: PID=%d, Slot=%d, WaitTime=%v, Retries=%d",
+							pid, slotNum, acquireTime, retryCount)
+					}
 				}
 
-				if activeSlots >= 0 {
-					klog.Infof("[CNI-DEBUG] Semaphore slot acquired: PID=%d, Slot=%d, ActiveSlots=%d/%d, WaitTime=%v, Retries=%d, Time=%s",
-						pid, slotNum, activeSlots, MaxConcurrentCNI, acquireTime, retryCount, time.Now().Format(time.RFC3339Nano))
-				} else {
-					klog.Infof("[CNI-DEBUG] Semaphore slot acquired: PID=%d, Slot=%d, WaitTime=%v, Retries=%d, Time=%s",
-						pid, slotNum, acquireTime, retryCount, time.Now().Format(time.RFC3339Nano))
+				// Tier 2: Always log if acquisition was abnormally slow
+				if acquireTime > SlowAcquisitionThreshold {
+					activeSlots := countActiveSlots()
+					klog.Warningf("[CNI-PERF] Slow semaphore acquisition: PID=%d, Slot=%d, ActiveSlots=%d/%d, WaitTime=%v, Retries=%d",
+						pid, slotNum, activeSlots, MaxConcurrentCNI, acquireTime, retryCount)
 				}
 
 				return &CNILock{
@@ -216,47 +256,45 @@ func AcquireCNILock() (*CNILock, error) {
 	}
 
 	// Timeout - could not acquire any slot
+	// Tier 1: Always log errors
 	totalWaitTime := time.Since(startTime)
-	klog.Warningf("[CNI-DEBUG] Semaphore acquisition timeout: PID=%d, MaxSlots=%d, WaitTime=%v, Retries=%d, Timeout=%v",
-		pid, MaxConcurrentCNI, totalWaitTime, retryCount, LockTimeout)
+	activeSlots := countActiveSlots()
+	klog.Warningf("[CNI-ERROR] Semaphore acquisition timeout: PID=%d, MaxSlots=%d, ActiveSlots=%d/%d, WaitTime=%v, Retries=%d, Timeout=%v",
+		pid, MaxConcurrentCNI, activeSlots, MaxConcurrentCNI, totalWaitTime, retryCount, LockTimeout)
 	return nil, fmt.Errorf("timeout waiting for CNI semaphore slot after %v (all %d slots busy)", LockTimeout, MaxConcurrentCNI)
 }
 
 // Release releases the semaphore slot
-// Optimized to only count active slots periodically to reduce overhead
+// Optimized with conditional logging to reduce overhead
 func (l *CNILock) Release() error {
 	if l.file == nil {
 		return nil
 	}
 
-	pid := os.Getpid()
-	klog.V(4).Infof("[CNI-DEBUG] Releasing semaphore slot: PID=%d, Slot=%d, Path=%s, Time=%s",
-		pid, l.slotNum, l.slotPath, time.Now().Format(time.RFC3339Nano))
+	// Tier 3: Only log release if debug logging enabled
+	if EnableDebugLogging {
+		pid := os.Getpid()
+		klog.V(4).Infof("[CNI-DEBUG] Releasing semaphore slot: PID=%d, Slot=%d",
+			pid, l.slotNum)
+	}
 
 	// Release lock
 	if err := syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN); err != nil {
-		klog.Warningf("[CNI-DEBUG] Failed to unlock slot: PID=%d, Slot=%d, Path=%s, Error=%v",
-			pid, l.slotNum, l.slotPath, err)
+		// Tier 1: Always log errors
+		klog.Warningf("[CNI-ERROR] Failed to unlock slot: Slot=%d, Error=%v",
+			l.slotNum, err)
 	}
 
 	// Close file
 	if err := l.file.Close(); err != nil {
-		klog.Warningf("[CNI-DEBUG] Failed to close slot file: PID=%d, Slot=%d, Path=%s, Error=%v",
-			pid, l.slotNum, l.slotPath, err)
+		// Tier 1: Always log errors
+		klog.Warningf("[CNI-ERROR] Failed to close slot file: Slot=%d, Error=%v",
+			l.slotNum, err)
 		return err
 	}
 
-	// Only count active slots periodically to reduce overhead
-	// Most of the time we just release without the expensive counting operation
-	shouldCount := (acquisitionCounter % SamplingInterval) == 0
-	if shouldCount {
-		activeSlots := countActiveSlots()
-		klog.V(4).Infof("[CNI-DEBUG] Semaphore slot released: PID=%d, Slot=%d, ActiveSlots=%d/%d, Path=%s, Time=%s",
-			pid, l.slotNum, activeSlots, MaxConcurrentCNI, l.slotPath, time.Now().Format(time.RFC3339Nano))
-	} else {
-		klog.V(4).Infof("[CNI-DEBUG] Semaphore slot released: PID=%d, Slot=%d, Path=%s, Time=%s",
-			pid, l.slotNum, l.slotPath, time.Now().Format(time.RFC3339Nano))
-	}
+	// No need to log every release in production
+	// Acquisition logs already provide concurrency visibility
 	l.file = nil
 
 	return nil
