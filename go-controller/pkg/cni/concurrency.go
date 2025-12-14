@@ -46,7 +46,7 @@ const (
 	// EnableDebugLogging controls detailed debug logging (Tier 3)
 	// Set to false in production to reduce overhead by ~95%
 	// Can be overridden via CNI_DEBUG_LOGGING environment variable
-	EnableDebugLogging = false
+	EnableDebugLogging = true
 
 	// LogSamplingRate controls how often to log normal operations
 	// Only log every Nth successful acquisition (reduces log volume)
