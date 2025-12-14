@@ -184,21 +184,9 @@ func (c *shimClientset) getPod(namespace, name string) (*corev1.Pod, error) {
 
 // CmdAdd is the callback for 'add' cni calls from skel
 func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
-	var processStartTime time.Time
-	var pid int
-
-	// Only track timing if debug logging enabled (avoid time.Now() overhead)
-	if EnableDebugLogging {
-		processStartTime = time.Now()
-		pid = os.Getpid()
-		klog.V(4).Infof("[CNI-DEBUG] CmdAdd process started: PID=%d, ContainerID=%s",
-			pid, args.ContainerID)
-	}
-
 	// Acquire semaphore slot to limit concurrent CNI operations (max 300)
 	// This prevents resource exhaustion (threads, goroutines, file descriptors)
 	// while allowing good parallelism for pod creation throughput
-	// Note: AcquireCNILock() has its own conditional logging
 	lock, err := AcquireCNILock()
 	if err != nil {
 		return fmt.Errorf("failed to acquire CNI semaphore slot: %v", err)
@@ -206,15 +194,7 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 
 	defer func() {
 		if releaseErr := lock.Release(); releaseErr != nil {
-			// Tier 1: Always log errors
-			klog.Warningf("[CNI-ERROR] Failed to release semaphore slot: %v", releaseErr)
-		}
-
-		// Tier 3: Only log completion if debug logging enabled
-		if EnableDebugLogging {
-			totalDuration := time.Since(processStartTime)
-			klog.V(4).Infof("[CNI-DEBUG] CmdAdd process completed: PID=%d, ContainerID=%s, TotalTime=%v",
-				pid, args.ContainerID, totalDuration)
+			klog.Warningf("Failed to release semaphore slot: %v", releaseErr)
 		}
 	}()
 
@@ -248,16 +228,7 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 
 	req := newCNIRequest(args, deviceInfo)
 
-	// Tier 3: Only log CNI server communication if debug logging enabled
-	if EnableDebugLogging {
-		klog.V(4).Infof("[CNI-DEBUG] Calling CNI server: PID=%d", pid)
-	}
-
 	body, errB := p.doCNIFunc("http://dummy/", req)
-
-	if EnableDebugLogging {
-		klog.V(4).Infof("[CNI-DEBUG] CNI server response received: PID=%d", pid)
-	}
 	if errB != nil {
 		cmdErr = errB
 		klog.Error(cmdErr.Error())
@@ -327,19 +298,7 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 
 // CmdDel is the callback for 'teardown' cni calls from skel
 func (p *Plugin) CmdDel(args *skel.CmdArgs) error {
-	var processStartTime time.Time
-	var pid int
-
-	// Only track timing if debug logging enabled (avoid time.Now() overhead)
-	if EnableDebugLogging {
-		processStartTime = time.Now()
-		pid = os.Getpid()
-		klog.V(4).Infof("[CNI-DEBUG] CmdDel process started: PID=%d, ContainerID=%s",
-			pid, args.ContainerID)
-	}
-
 	// Acquire semaphore slot to limit concurrent CNI operations (max 300)
-	// Note: AcquireCNILock() has its own conditional logging
 	lock, err := AcquireCNILock()
 	if err != nil {
 		return fmt.Errorf("failed to acquire CNI semaphore slot: %v", err)
@@ -347,15 +306,7 @@ func (p *Plugin) CmdDel(args *skel.CmdArgs) error {
 
 	defer func() {
 		if releaseErr := lock.Release(); releaseErr != nil {
-			// Tier 1: Always log errors
-			klog.Warningf("[CNI-ERROR] Failed to release semaphore slot: %v", releaseErr)
-		}
-
-		// Tier 3: Only log completion if debug logging enabled
-		if EnableDebugLogging {
-			totalDuration := time.Since(processStartTime)
-			klog.V(4).Infof("[CNI-DEBUG] CmdDel process completed: PID=%d, ContainerID=%s, TotalTime=%v",
-				pid, args.ContainerID, totalDuration)
+			klog.Warningf("Failed to release semaphore slot: %v", releaseErr)
 		}
 	}()
 
