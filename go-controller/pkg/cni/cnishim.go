@@ -298,17 +298,13 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 
 // CmdDel is the callback for 'teardown' cni calls from skel
 func (p *Plugin) CmdDel(args *skel.CmdArgs) error {
-	// Acquire semaphore slot to limit concurrent CNI operations (max 300)
-	lock, err := AcquireCNILock()
-	if err != nil {
-		return fmt.Errorf("failed to acquire CNI semaphore slot: %v", err)
-	}
-
-	defer func() {
-		if releaseErr := lock.Release(); releaseErr != nil {
-			klog.Warningf("Failed to release semaphore slot: %v", releaseErr)
-		}
-	}()
+	// NOTE: DEL operations do NOT acquire semaphore lock
+	// Rationale:
+	// 1. Cleanup operations must succeed even during high load to prevent resource leaks
+	// 2. DEL operations release resources (OVS ports, IPs) rather than consume them
+	// 3. Container GC depends on DEL succeeding - blocking DEL causes GC failures
+	// 4. DEL is typically lightweight and doesn't cause resource exhaustion
+	// The semaphore is only for ADD operations to prevent pod creation storms
 
 	var cmdErr error
 	var body []byte
