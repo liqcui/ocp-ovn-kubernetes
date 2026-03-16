@@ -6,12 +6,14 @@ import (
 	"sync"
 	"time"
 
+	cnitypes "github.com/containernetworking/cni/pkg/types"
 	"github.com/safchain/ethtool"
 
 	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
 	"k8s.io/klog/v2"
 
+	ovncnitypes "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/cni/types"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
 	egressipv1 "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/crd/egressip/v1"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/factory"
@@ -339,15 +341,45 @@ func (g *gateway) Start() error {
 		klog.Info("Initializing base OpenFlow rules and starting OpenFlow manager")
 
 		// Initialize base flows (network-independent)
-		hostIPs, _ := g.nodeIPManager.ListAddresses()
+		hostIPs, hostSubnets := g.nodeIPManager.ListAddresses()
 		err := g.openflowManager.initializeBaseFlows(hostIPs)
 		if err != nil {
 			return fmt.Errorf("failed to initialize base flows: %w", err)
 		}
 
-		// Note: Default network flows will be added during Reconcile() or when
-		// the default network is registered via AddNetwork(). We don't add them
-		// here because the network configuration may not be ready yet at startup.
+		// For UDN mode: Register and add default network flows at startup
+		// This is CRITICAL - without this, default network flows are never added
+		// because addNetworkFlows() requires network config to be registered first
+		if util.IsNetworkSegmentationSupportEnabled() {
+			klog.V(4).Infof("UDN mode: Registering default network configuration at startup")
+
+			// Create NetInfo for default network
+			// For default network, NewNetInfo returns DefaultNetInfo when Name == DefaultNetworkName
+			defaultNetInfo, err := util.NewNetInfo(&ovncnitypes.NetConf{
+				NetConf:  cnitypes.NetConf{Name: types.DefaultNetworkName},
+				Topology: types.Layer3Topology,
+				Role:     types.NetworkRolePrimary,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create default network NetInfo: %w", err)
+			}
+
+			// Register default network config (populates netConfig map in bridge)
+			// UDN networks pass masqCTMark, pktMark, and masqIPs, but default network doesn't need them
+			if err := g.openflowManager.addNetwork(defaultNetInfo, hostSubnets, nil, 0, 0, nil, nil); err != nil {
+				return fmt.Errorf("failed to register default network config: %w", err)
+			}
+			klog.V(4).Infof("Successfully registered default network config at startup")
+
+			// Add default network flows (now will succeed because config is registered)
+			if err := g.openflowManager.addNetworkFlows(types.DefaultNetworkName, hostIPs, hostSubnets); err != nil {
+				return fmt.Errorf("failed to add default network flows: %w", err)
+			}
+			klog.V(4).Infof("Successfully added default network flows at startup")
+
+			// Sync flows to OVS
+			g.openflowManager.requestFlowSync()
+		}
 
 		g.openflowManager.Run(g.stopChan, g.wg)
 	}
@@ -549,20 +581,19 @@ func (g *gateway) Reconcile() error {
 				// let's sync these flows immediately
 				g.openflowManager.requestFlowSync()
 			} else {
-				// For UDN mode: ensure default network flows are added if not already present
-				if !g.openflowManager.hasNetworkFlows(types.DefaultNetworkName) {
-					klog.V(4).Infof("Adding default network flows during reconcile (not present at startup)")
-					hostIPs, hostSubnets := g.nodeIPManager.ListAddresses()
-					if err := g.openflowManager.addNetworkFlows(types.DefaultNetworkName, hostIPs, hostSubnets); err != nil {
-						// This may fail if network config not ready yet, will retry on next reconcile
-						klog.V(4).Infof("Failed to add default network flows during reconcile: %v (will retry)", err)
-					} else {
-						g.openflowManager.requestFlowSync()
-						klog.V(4).Infof("Successfully added default network flows during reconcile")
-					}
-				} else {
-					klog.V(5).Info("Default network flows already present, skipping")
+				// For UDN mode: Update default network flows incrementally
+				// This handles IP address changes while preserving UDN network flows
+				klog.V(5).Info("UDN mode: Updating default network flows during reconcile")
+				hostIPs, hostSubnets := g.nodeIPManager.ListAddresses()
+
+				// Delete old flows and re-add with updated IPs (incremental update)
+				g.openflowManager.deleteNetworkFlows(types.DefaultNetworkName)
+				if err := g.openflowManager.addNetworkFlows(types.DefaultNetworkName, hostIPs, hostSubnets); err != nil {
+					return fmt.Errorf("failed to update default network flows during reconcile: %w", err)
 				}
+
+				g.openflowManager.requestFlowSync()
+				klog.V(5).Info("Default network flows updated successfully during reconcile")
 			}
 		}
 	}
