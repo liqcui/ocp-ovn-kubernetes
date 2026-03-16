@@ -1774,6 +1774,48 @@ func newGateway(
 			return err
 		}
 
+		// Initialize base OpenFlow flows immediately after creating openflowManager
+		// This must happen here (in initFunc) before gateway.Init() is called,
+		// because gateway.Init() may be called before Start(), and UDN network
+		// controllers may start processing networks before Start() runs.
+		klog.Info("Initializing base OpenFlow rules")
+		hostIPs, hostSubnets := gw.nodeIPManager.ListAddresses()
+		if err := gw.openflowManager.initializeBaseFlows(hostIPs); err != nil {
+			return fmt.Errorf("failed to initialize base flows: %w", err)
+		}
+
+		// For UDN mode: Register and add default network flows at initialization
+		// This must happen before any UDN network controllers start, otherwise
+		// UDN networks may try to call addNetworkFlows() before base flows exist
+		if util.IsNetworkSegmentationSupportEnabled() {
+			klog.V(4).Infof("UDN mode: Registering default network configuration")
+
+			// Create NetInfo for default network
+			defaultNetInfo, err := util.NewNetInfo(&ovncnitypes.NetConf{
+				NetConf:  cnitypes.NetConf{Name: types.DefaultNetworkName},
+				Topology: types.Layer3Topology,
+				Role:     types.NetworkRolePrimary,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create default network NetInfo: %w", err)
+			}
+
+			// Register default network config (populates netConfig map in bridge)
+			if err := gw.openflowManager.addNetwork(defaultNetInfo, hostSubnets, nil, 0, 0, nil, nil); err != nil {
+				return fmt.Errorf("failed to register default network config: %w", err)
+			}
+			klog.V(4).Infof("Successfully registered default network config")
+
+			// Add default network flows (now will succeed because config is registered)
+			if err := gw.openflowManager.addNetworkFlows(types.DefaultNetworkName, hostIPs, hostSubnets); err != nil {
+				return fmt.Errorf("failed to add default network flows: %w", err)
+			}
+			klog.V(4).Infof("Successfully added default network flows")
+
+			// Sync flows to OVS
+			gw.openflowManager.requestFlowSync()
+		}
+
 		// resync flows on IP change
 		gw.nodeIPManager.OnChanged = func() {
 			klog.V(5).Info("Node addresses changed, re-syncing bridge flows")
