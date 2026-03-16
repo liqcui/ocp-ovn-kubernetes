@@ -333,28 +333,22 @@ func (g *gateway) Init(stopChan <-chan struct{}, wg *sync.WaitGroup) error {
 		}
 	}
 
-	return nil
-}
-
-func (g *gateway) Start() error {
+	// Initialize base OpenFlow flows early in Init() so they're ready before
+	// any network controllers start (which may happen before Start() is called)
 	if g.openflowManager != nil {
-		klog.Info("Initializing base OpenFlow rules and starting OpenFlow manager")
-
-		// Initialize base flows (network-independent)
+		klog.Info("Initializing base OpenFlow rules")
 		hostIPs, hostSubnets := g.nodeIPManager.ListAddresses()
-		err := g.openflowManager.initializeBaseFlows(hostIPs)
-		if err != nil {
+		if err := g.openflowManager.initializeBaseFlows(hostIPs); err != nil {
 			return fmt.Errorf("failed to initialize base flows: %w", err)
 		}
 
-		// For UDN mode: Register and add default network flows at startup
-		// This is CRITICAL - without this, default network flows are never added
-		// because addNetworkFlows() requires network config to be registered first
+		// For UDN mode: Register and add default network flows at initialization
+		// This must happen in Init() before any UDN network controllers start,
+		// otherwise UDN networks may try to call addNetworkFlows() before base flows exist
 		if util.IsNetworkSegmentationSupportEnabled() {
-			klog.V(4).Infof("UDN mode: Registering default network configuration at startup")
+			klog.V(4).Infof("UDN mode: Registering default network configuration")
 
 			// Create NetInfo for default network
-			// For default network, NewNetInfo returns DefaultNetInfo when Name == DefaultNetworkName
 			defaultNetInfo, err := util.NewNetInfo(&ovncnitypes.NetConf{
 				NetConf:  cnitypes.NetConf{Name: types.DefaultNetworkName},
 				Topology: types.Layer3Topology,
@@ -365,22 +359,31 @@ func (g *gateway) Start() error {
 			}
 
 			// Register default network config (populates netConfig map in bridge)
-			// UDN networks pass masqCTMark, pktMark, and masqIPs, but default network doesn't need them
 			if err := g.openflowManager.addNetwork(defaultNetInfo, hostSubnets, nil, 0, 0, nil, nil); err != nil {
 				return fmt.Errorf("failed to register default network config: %w", err)
 			}
-			klog.V(4).Infof("Successfully registered default network config at startup")
+			klog.V(4).Infof("Successfully registered default network config")
 
 			// Add default network flows (now will succeed because config is registered)
 			if err := g.openflowManager.addNetworkFlows(types.DefaultNetworkName, hostIPs, hostSubnets); err != nil {
 				return fmt.Errorf("failed to add default network flows: %w", err)
 			}
-			klog.V(4).Infof("Successfully added default network flows at startup")
+			klog.V(4).Infof("Successfully added default network flows")
 
 			// Sync flows to OVS
 			g.openflowManager.requestFlowSync()
 		}
+	}
 
+	return nil
+}
+
+func (g *gateway) Start() error {
+	// Note: Base flows and default network flows are now initialized in Init()
+	// to ensure they're ready before any network controllers start processing networks
+
+	if g.openflowManager != nil {
+		klog.Info("Starting OpenFlow manager")
 		g.openflowManager.Run(g.stopChan, g.wg)
 	}
 
