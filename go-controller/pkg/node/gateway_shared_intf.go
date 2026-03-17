@@ -13,7 +13,6 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
-	cnitypes "github.com/containernetworking/cni/pkg/types"
 	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -24,7 +23,6 @@ import (
 	utilnet "k8s.io/utils/net"
 	"sigs.k8s.io/knftables"
 
-	ovncnitypes "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/cni/types"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/kube"
@@ -1775,53 +1773,6 @@ func newGateway(
 		if err != nil {
 			return err
 		}
-
-		// Initialize OpenFlow flows immediately after creating openflowManager
-		// This must happen here (in initFunc) before gateway.Init() is called,
-		// because gateway.Init() may be called before Start(), and UDN network
-		// controllers may start processing networks before Start() runs.
-		klog.Info("Initializing gateway OpenFlow rules")
-		hostIPs, hostSubnets := gw.nodeIPManager.ListAddresses()
-
-		// For UDN mode: Register default network BEFORE initializing flows
-		// This ensures the default network config exists when updateBridgeFlowCache runs
-		if util.IsNetworkSegmentationSupportEnabled() {
-			klog.Info("UDN mode: Registering default network configuration")
-
-			// Create NetInfo for default network
-			defaultNetInfo, err := util.NewNetInfo(&ovncnitypes.NetConf{
-				NetConf:  cnitypes.NetConf{Name: types.DefaultNetworkName},
-				Topology: types.Layer3Topology,
-				Role:     types.NetworkRolePrimary,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to create default network NetInfo: %w", err)
-			}
-
-			// Register default network config (populates netConfig map in bridge)
-			if err := gw.openflowManager.addNetwork(defaultNetInfo, hostSubnets, nil, 0, 0, nil, nil); err != nil {
-				return fmt.Errorf("failed to register default network config: %w", err)
-			}
-			klog.Info("Successfully registered default network config")
-		}
-
-		// Initialize base flows first - sets flowCache["NORMAL"] and flowCache["BASE"]
-		// These keys are required by addNetworkFlows() for incremental UDN network additions
-		if err := gw.openflowManager.initializeBaseFlows(hostIPs); err != nil {
-			return fmt.Errorf("failed to initialize base flows: %w", err)
-		}
-		klog.Info("Base flows initialized (flowCache keys set for incremental updates)")
-
-		// Initialize all flows using updateBridgeFlowCache for comprehensive setup
-		// This generates flows for all networks (currently just default) and all services
-		// Unlike addNetworkFlows(), this includes service flows and full connectivity
-		if err := gw.openflowManager.updateBridgeFlowCache(hostIPs, hostSubnets); err != nil {
-			return fmt.Errorf("failed to initialize gateway flows: %w", err)
-		}
-		klog.Info("Successfully initialized gateway flows")
-
-		// Sync flows to OVS
-		gw.openflowManager.requestFlowSync()
 
 		// resync flows on IP change
 		gw.nodeIPManager.OnChanged = func() {

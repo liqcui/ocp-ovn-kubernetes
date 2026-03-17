@@ -339,12 +339,12 @@ func (g *gateway) Init(stopChan <-chan struct{}, wg *sync.WaitGroup) error {
 }
 
 func (g *gateway) Start() error {
-	// Note: Base flows and default network flows are initialized in initFunc()
-	// (see gateway_shared_intf.go) which runs before Init() is called.
-	// This ensures openflowManager and nodeIPManager exist before we use them.
-
 	if g.openflowManager != nil {
-		klog.Info("Starting OpenFlow manager")
+		klog.Info("Spawning Conntrack Rule Check Thread")
+		err := g.openflowManager.updateBridgeFlowCache(g.nodeIPManager.ListAddresses())
+		if err != nil {
+			return fmt.Errorf("failed to update bridge flow cache: %w", err)
+		}
 		g.openflowManager.Run(g.stopChan, g.wg)
 	}
 
