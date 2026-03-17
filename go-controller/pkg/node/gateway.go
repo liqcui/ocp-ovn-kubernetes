@@ -536,29 +536,13 @@ func (g *gateway) Reconcile() error {
 	klog.Info("Reconciling gateway with updates")
 	if config.OvnKubeNode.Mode != types.NodeModeDPUHost {
 		if g.openflowManager != nil {
-			// When UDN is enabled, flows are managed incrementally via addNetworkFlows/deleteNetworkFlows.
-			// Skip the O(N) updateBridgeFlowCache which regenerates all flows.
-			if !util.IsNetworkSegmentationSupportEnabled() {
-				if err := g.openflowManager.updateBridgeFlowCache(g.nodeIPManager.ListAddresses()); err != nil {
-					return err
-				}
-				// let's sync these flows immediately
-				g.openflowManager.requestFlowSync()
-			} else {
-				// For UDN mode: Update default network flows incrementally
-				// This handles IP address changes while preserving UDN network flows
-				klog.V(5).Info("UDN mode: Updating default network flows during reconcile")
-				hostIPs, hostSubnets := g.nodeIPManager.ListAddresses()
-
-				// Delete old flows and re-add with updated IPs (incremental update)
-				g.openflowManager.deleteNetworkFlows(types.DefaultNetworkName)
-				if err := g.openflowManager.addNetworkFlows(types.DefaultNetworkName, hostIPs, hostSubnets); err != nil {
-					return fmt.Errorf("failed to update default network flows during reconcile: %w", err)
-				}
-
-				g.openflowManager.requestFlowSync()
-				klog.V(5).Info("Default network flows updated successfully during reconcile")
+			// Use updateBridgeFlowCache for comprehensive flow regeneration
+			// This regenerates all flows for all networks and services
+			if err := g.openflowManager.updateBridgeFlowCache(g.nodeIPManager.ListAddresses()); err != nil {
+				return err
 			}
+			// let's sync these flows immediately
+			g.openflowManager.requestFlowSync()
 		}
 	}
 	// TBD updateSNATRules() gets node host-cidr by accessing gateway.nodeIPManager, which does not
