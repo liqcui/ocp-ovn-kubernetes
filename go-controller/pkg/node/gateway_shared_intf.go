@@ -1805,6 +1805,13 @@ func newGateway(
 			klog.V(4).Infof("Successfully registered default network config")
 		}
 
+		// Initialize base flows first - sets flowCache["NORMAL"] and flowCache["BASE"]
+		// These keys are required by addNetworkFlows() for incremental UDN network additions
+		if err := gw.openflowManager.initializeBaseFlows(hostIPs); err != nil {
+			return fmt.Errorf("failed to initialize base flows: %w", err)
+		}
+		klog.V(4).Info("Base flows initialized (flowCache keys set for incremental updates)")
+
 		// Initialize all flows using updateBridgeFlowCache for comprehensive setup
 		// This generates flows for all networks (currently just default) and all services
 		// Unlike addNetworkFlows(), this includes service flows and full connectivity
