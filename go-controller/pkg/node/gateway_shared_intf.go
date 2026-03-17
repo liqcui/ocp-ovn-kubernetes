@@ -1786,7 +1786,7 @@ func newGateway(
 		// For UDN mode: Register default network BEFORE initializing flows
 		// This ensures the default network config exists when updateBridgeFlowCache runs
 		if util.IsNetworkSegmentationSupportEnabled() {
-			klog.V(4).Infof("UDN mode: Registering default network configuration")
+			klog.Info("UDN mode: Registering default network configuration")
 
 			// Create NetInfo for default network
 			defaultNetInfo, err := util.NewNetInfo(&ovncnitypes.NetConf{
@@ -1802,7 +1802,7 @@ func newGateway(
 			if err := gw.openflowManager.addNetwork(defaultNetInfo, hostSubnets, nil, 0, 0, nil, nil); err != nil {
 				return fmt.Errorf("failed to register default network config: %w", err)
 			}
-			klog.V(4).Infof("Successfully registered default network config")
+			klog.Info("Successfully registered default network config")
 		}
 
 		// Initialize base flows first - sets flowCache["NORMAL"] and flowCache["BASE"]
@@ -1810,7 +1810,7 @@ func newGateway(
 		if err := gw.openflowManager.initializeBaseFlows(hostIPs); err != nil {
 			return fmt.Errorf("failed to initialize base flows: %w", err)
 		}
-		klog.V(4).Info("Base flows initialized (flowCache keys set for incremental updates)")
+		klog.Info("Base flows initialized (flowCache keys set for incremental updates)")
 
 		// Initialize all flows using updateBridgeFlowCache for comprehensive setup
 		// This generates flows for all networks (currently just default) and all services
