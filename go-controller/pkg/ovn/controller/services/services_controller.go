@@ -378,11 +378,12 @@ func (c *Controller) syncService(key string) error {
 	if err != nil {
 		return err
 	}
-	klog.V(5).Infof("Processing sync for service %s/%s for network=%s", namespace, name, c.netInfo.GetNetworkName())
+	// SERVICE SYNC TIMING: Changed from V(5) to V(4) for better visibility at default UDN log level
+	klog.V(4).Infof("Processing sync for service %s/%s for network=%s", namespace, name, c.netInfo.GetNetworkName())
 	metrics.MetricSyncServiceCount.Inc()
 
 	defer func() {
-		klog.V(5).Infof("Finished syncing service %s on namespace %s for network=%s : %v", name, namespace, c.netInfo.GetNetworkName(), time.Since(startTime))
+		klog.V(4).Infof("Finished syncing service %s on namespace %s for network=%s in %v", name, namespace, c.netInfo.GetNetworkName(), time.Since(startTime))
 		metrics.MetricSyncServiceLatency.Observe(time.Since(startTime).Seconds())
 	}()
 
@@ -500,9 +501,14 @@ func (c *Controller) syncService(key string) error {
 		//
 		// Note: this may fail if a node was deleted between listing nodes and applying.
 		// If so, this will fail and we will resync.
+		// SERVICE SYNC TIMING: Added timing instrumentation for load balancer creation
+		lbStartTime := time.Now()
 		if err := EnsureLBs(c.nbClient, service, existingLBs, lbs, c.netInfo); err != nil {
 			return fmt.Errorf("failed to ensure service %s load balancers for network=%s: %w", key, c.netInfo.GetNetworkName(), err)
 		}
+		lbDuration := time.Since(lbStartTime)
+		klog.V(4).Infof("Created/updated %d load balancers for service %s in %v (network=%s)",
+			len(lbs), key, lbDuration, c.netInfo.GetNetworkName())
 
 		c.alreadyAppliedRWLock.Lock()
 		c.alreadyApplied[key] = lbs
@@ -636,7 +642,8 @@ func (c *Controller) onServiceAdd(obj interface{}) {
 		return
 	}
 	recorders.GetConfigDurationRecorder().Start("service", service.Namespace, service.Name)
-	klog.V(5).Infof("Adding service %s for network=%s", key, c.netInfo.GetNetworkName())
+	// SERVICE SYNC TIMING: Changed from V(5) to V(4) for visibility
+	klog.V(4).Infof("Adding service %s for network=%s", key, c.netInfo.GetNetworkName())
 	c.queue.Add(key)
 }
 
