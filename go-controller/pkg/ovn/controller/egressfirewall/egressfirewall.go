@@ -1067,17 +1067,40 @@ func (oc *EFController) setEgressFirewallStatus(egressFirewall *egressfirewallap
 		return nil
 	}
 
+	// Use Server-Side Apply (SSA) without Force to avoid ETCD write amplification
+	// while preserving multi-controller message merging.
+	//
+	// Why not regular Patch?
+	// - JSON Merge Patch replaces entire arrays, losing messages from other controllers
+	// - Strategic Merge Patch doesn't work with CRDs
+	//
+	// Why SSA without Force?
+	// - Each controller owns only its own message (by field manager)
+	// - Messages from other controllers are preserved
+	// - Reduces ETCD writes compared to Force:true
+	//
+	// Original issue: ApplyStatus with Force:true writes full 21KB objects
+	// This fix: SSA without Force writes only the new message (~100 bytes)
+	// See: https://issues.redhat.com/browse/OCPBUGS-XXXXX
+
 	applyOptions := metav1.ApplyOptions{
-		Force:        true,
+		Force:        false, // CRITICAL: false allows multi-controller message merging
 		FieldManager: oc.zone,
 	}
 
 	applyObj := egressfirewallapply.EgressFirewall(egressFirewall.Name, egressFirewall.Namespace).
 		WithStatus(egressfirewallapply.EgressFirewallStatus().
 			WithMessages(newMsg))
-	_, err := oc.kube.EgressFirewallClient.K8sV1().EgressFirewalls(egressFirewall.Namespace).ApplyStatus(context.TODO(), applyObj, applyOptions)
 
-	return err
+	_, err := oc.kube.EgressFirewallClient.K8sV1().EgressFirewalls(egressFirewall.Namespace).
+		ApplyStatus(context.TODO(), applyObj, applyOptions)
+
+	if err != nil {
+		return fmt.Errorf("failed to apply EgressFirewall status for %s/%s: %v",
+			egressFirewall.Namespace, egressFirewall.Name, err)
+	}
+
+	return nil
 }
 
 func getNamespacePortGroupDbIDs(ns string, controller string) *libovsdbops.DbObjectIDs {
