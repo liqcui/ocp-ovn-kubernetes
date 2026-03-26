@@ -45,7 +45,6 @@ RUN INSTALL_PKGS=" \
 	tcpdump iputils \
 	libreswan \
 	ethtool conntrack-tools \
-	openshift-clients \
 	" && \
 	dnf --setopt=retries=2 --setopt=timeout=2 install -y --nodocs $INSTALL_PKGS && \
 	eval "dnf --setopt=retries=2 --setopt=timeout=2 install -y --nodocs $(cat /more-pkgs)" && \
@@ -70,8 +69,6 @@ COPY --from=rhel8 /go/src/github.com/openshift/ovn-kubernetes/go-controller/_out
 # Copy RHEL-8 ovnkube-trace file into /usr/lib/rhel8 directory so that user can download and run it on RHEL-8 platform.
 RUN mkdir -p /usr/lib/rhel8
 COPY --from=rhel8 /go/src/github.com/openshift/ovn-kubernetes/go-controller/_output/go/bin/ovnkube-trace /usr/lib/rhel8/
-
-RUN stat /usr/bin/oc
 
 LABEL io.k8s.display-name="ovn kubernetes" \
       io.k8s.description="This is a component of OpenShift Container Platform that provides an overlay network using ovn." \
