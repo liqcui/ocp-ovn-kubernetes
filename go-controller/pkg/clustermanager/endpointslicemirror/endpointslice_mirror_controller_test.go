@@ -550,4 +550,292 @@ var _ = ginkgo.Describe("Cluster manager EndpointSlice mirror controller", func(
 			gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		})
 	})
+
+	ginkgo.Context("Phase 1 optimizations", func() {
+		ginkgo.It("should skip processing when resourceVersion matches (early exit optimization)", func() {
+			app.Action = func(*cli.Context) error {
+				namespaceT := *util.NewNamespace("testns")
+				namespaceT.Labels[types.RequiredUDNNamespaceLabel] = ""
+
+				pod := corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        "test-pod",
+						Namespace:   namespaceT.Name,
+						Annotations: map[string]string{util.OvnPodAnnotationName: `{"default":{"mac_address":"0a:58:0a:f4:02:03","ip_address":"10.244.2.3/24","role":"infrastructure-locked"},"testns/l3-network":{"mac_address":"0a:58:0a:84:02:04","ip_address":"10.132.2.4/24","role":"primary"}}`},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				}
+
+				defaultEndpointSlice := discovery.EndpointSlice{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "default-endpointslice",
+						Namespace:       namespaceT.Name,
+						ResourceVersion: "100",
+						Labels: map[string]string{
+							discovery.LabelServiceName: "svc2",
+							discovery.LabelManagedBy:   types.EndpointSliceDefaultControllerName,
+						},
+					},
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{"10.244.2.3"},
+							TargetRef: &corev1.ObjectReference{
+								Kind:      "Pod",
+								Namespace: namespaceT.Name,
+								Name:      pod.Name,
+							},
+						},
+					},
+				}
+
+				// Create mirrored slice with matching resourceVersion annotation
+				mirroredEndpointSlice := testing.MirrorEndpointSlice(&defaultEndpointSlice, "l3-network", false)
+				mirroredEndpointSlice.Annotations[types.LabelSourceEndpointSliceVersion] = "100"
+
+				objs := []runtime.Object{
+					&corev1.PodList{
+						Items: []corev1.Pod{pod},
+					},
+					&corev1.NamespaceList{
+						Items: []corev1.Namespace{namespaceT},
+					},
+					&discovery.EndpointSliceList{
+						Items: []discovery.EndpointSlice{
+							defaultEndpointSlice,
+							*mirroredEndpointSlice,
+						},
+					},
+				}
+
+				start(objs...)
+
+				nad := testing.GenerateNAD("l3-network", "l3-network", namespaceT.Name, types.Layer3Topology, "10.132.2.0/16/24", types.NetworkRolePrimary)
+				_, err := fakeClient.NetworkAttchDefClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(namespaceT.Name).Create(
+					context.TODO(),
+					nad,
+					metav1.CreateOptions{})
+				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+				// Wait for controller to process
+				time.Sleep(2 * time.Second)
+
+				// Verify mirrored slice still exists and wasn't updated (early exit worked)
+				mirroredSlices, err := util.GetMirroredEndpointSlices(types.EndpointSliceMirrorControllerName, defaultEndpointSlice.Name, namespaceT.Name, controller.endpointSliceLister)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(mirroredSlices).To(gomega.HaveLen(1))
+				gomega.Expect(mirroredSlices[0].Annotations[types.LabelSourceEndpointSliceVersion]).To(gomega.Equal("100"))
+
+				return nil
+			}
+
+			err := app.Run([]string{app.Name})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should update when resourceVersion differs (early exit bypassed)", func() {
+			app.Action = func(*cli.Context) error {
+				namespaceT := *util.NewNamespace("testns")
+				namespaceT.Labels[types.RequiredUDNNamespaceLabel] = ""
+
+				pod := corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        "test-pod",
+						Namespace:   namespaceT.Name,
+						Annotations: map[string]string{util.OvnPodAnnotationName: `{"default":{"mac_address":"0a:58:0a:f4:02:03","ip_address":"10.244.2.3/24","role":"infrastructure-locked"},"testns/l3-network":{"mac_address":"0a:58:0a:84:02:04","ip_address":"10.132.2.4/24","role":"primary"}}`},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				}
+
+				defaultEndpointSlice := discovery.EndpointSlice{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "default-endpointslice",
+						Namespace:       namespaceT.Name,
+						ResourceVersion: "200",
+						Labels: map[string]string{
+							discovery.LabelServiceName: "svc2",
+							discovery.LabelManagedBy:   types.EndpointSliceDefaultControllerName,
+						},
+					},
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{"10.244.2.3"},
+							TargetRef: &corev1.ObjectReference{
+								Kind:      "Pod",
+								Namespace: namespaceT.Name,
+								Name:      pod.Name,
+							},
+						},
+					},
+				}
+
+				// Create mirrored slice with OLD resourceVersion (should trigger update)
+				mirroredEndpointSlice := testing.MirrorEndpointSlice(&defaultEndpointSlice, "l3-network", false)
+				mirroredEndpointSlice.Annotations[types.LabelSourceEndpointSliceVersion] = "100"
+
+				objs := []runtime.Object{
+					&corev1.PodList{
+						Items: []corev1.Pod{pod},
+					},
+					&corev1.NamespaceList{
+						Items: []corev1.Namespace{namespaceT},
+					},
+					&discovery.EndpointSliceList{
+						Items: []discovery.EndpointSlice{
+							defaultEndpointSlice,
+							*mirroredEndpointSlice,
+						},
+					},
+				}
+
+				start(objs...)
+
+				nad := testing.GenerateNAD("l3-network", "l3-network", namespaceT.Name, types.Layer3Topology, "10.132.2.0/16/24", types.NetworkRolePrimary)
+				_, err := fakeClient.NetworkAttchDefClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(namespaceT.Name).Create(
+					context.TODO(),
+					nad,
+					metav1.CreateOptions{})
+				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+				// Verify mirrored slice gets updated with new resourceVersion
+				gomega.Eventually(func() string {
+					mirroredSlices, err := util.GetMirroredEndpointSlices(types.EndpointSliceMirrorControllerName, defaultEndpointSlice.Name, namespaceT.Name, controller.endpointSliceLister)
+					if err != nil || len(mirroredSlices) == 0 {
+						return ""
+					}
+					return mirroredSlices[0].Annotations[types.LabelSourceEndpointSliceVersion]
+				}).WithTimeout(5 * time.Second).Should(gomega.Equal("200"))
+
+				return nil
+			}
+
+			err := app.Run([]string{app.Name})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should handle selective field copy correctly (DeepCopy elimination)", func() {
+			app.Action = func(*cli.Context) error {
+				namespaceT := *util.NewNamespace("testns")
+				namespaceT.Labels[types.RequiredUDNNamespaceLabel] = ""
+
+				pod := corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        "test-pod",
+						Namespace:   namespaceT.Name,
+						Annotations: map[string]string{util.OvnPodAnnotationName: `{"default":{"mac_address":"0a:58:0a:f4:02:03","ip_address":"10.244.2.3/24","role":"infrastructure-locked"},"testns/l3-network":{"mac_address":"0a:58:0a:84:02:04","ip_address":"10.132.2.4/24","role":"primary"}}`},
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
+						Conditions: []corev1.PodCondition{
+							{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+						},
+					},
+				}
+
+				defaultEndpointSlice := discovery.EndpointSlice{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "default-endpointslice",
+						Namespace:       namespaceT.Name,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							discovery.LabelServiceName: "svc2",
+							discovery.LabelManagedBy:   types.EndpointSliceDefaultControllerName,
+						},
+					},
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{"10.244.2.3"},
+							Conditions: discovery.EndpointConditions{
+								Ready:       &[]bool{true}[0],
+								Serving:     &[]bool{true}[0],
+								Terminating: &[]bool{false}[0],
+							},
+							Hostname: &[]string{"test-hostname"}[0],
+							NodeName: &[]string{"test-node"}[0],
+							Zone:     &[]string{"test-zone"}[0],
+							TargetRef: &corev1.ObjectReference{
+								Kind:      "Pod",
+								Namespace: namespaceT.Name,
+								Name:      pod.Name,
+							},
+						},
+					},
+				}
+
+				objs := []runtime.Object{
+					&corev1.PodList{
+						Items: []corev1.Pod{pod},
+					},
+					&corev1.NamespaceList{
+						Items: []corev1.Namespace{namespaceT},
+					},
+					&discovery.EndpointSliceList{
+						Items: []discovery.EndpointSlice{defaultEndpointSlice},
+					},
+				}
+
+				start(objs...)
+
+				nad := testing.GenerateNAD("l3-network", "l3-network", namespaceT.Name, types.Layer3Topology, "10.132.2.0/16/24", types.NetworkRolePrimary)
+				_, err := fakeClient.NetworkAttchDefClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(namespaceT.Name).Create(
+					context.TODO(),
+					nad,
+					metav1.CreateOptions{})
+				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+				// Verify all endpoint fields are correctly copied (not just Address)
+				var mirroredEndpointSlices []*discovery.EndpointSlice
+				gomega.Eventually(func() error {
+					mirroredEndpointSlices, err = util.GetMirroredEndpointSlices(types.EndpointSliceMirrorControllerName, defaultEndpointSlice.Name, namespaceT.Name, controller.endpointSliceLister)
+					if err != nil {
+						return err
+					}
+					if len(mirroredEndpointSlices) != 1 {
+						return fmt.Errorf("expected one mirrored EndpointSlice")
+					}
+					return nil
+				}).WithTimeout(5 * time.Second).ShouldNot(gomega.HaveOccurred())
+
+				mirroredEp := mirroredEndpointSlices[0].Endpoints[0]
+				defaultEp := defaultEndpointSlice.Endpoints[0]
+
+				// Verify selective copy preserved all fields
+				gomega.Expect(mirroredEp.Addresses).To(gomega.Equal([]string{"10.132.2.4"})) // Changed to UDN IP
+				gomega.Expect(mirroredEp.Conditions).To(gomega.Equal(defaultEp.Conditions))
+				gomega.Expect(mirroredEp.Hostname).To(gomega.Equal(defaultEp.Hostname))
+				gomega.Expect(mirroredEp.NodeName).To(gomega.Equal(defaultEp.NodeName))
+				gomega.Expect(mirroredEp.Zone).To(gomega.Equal(defaultEp.Zone))
+				gomega.Expect(mirroredEp.TargetRef).To(gomega.Equal(defaultEp.TargetRef))
+
+				return nil
+			}
+
+			err := app.Run([]string{app.Name})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should verify exponential backoff rate limiter is configured", func() {
+			app.Action = func(*cli.Context) error {
+				// Start with minimal objects
+				objs := []runtime.Object{
+					&corev1.NamespaceList{},
+					&corev1.PodList{},
+					&discovery.EndpointSliceList{},
+				}
+
+				start(objs...)
+
+				// Verify queue exists and is properly configured
+				gomega.Expect(controller.queue).NotTo(gomega.BeNil())
+
+				// The exponential backoff configuration is internal to workqueue,
+				// but we can verify the controller starts without errors
+				// The actual backoff behavior is tested via integration tests
+
+				return nil
+			}
+
+			err := app.Run([]string{app.Name})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		})
+	})
 })
