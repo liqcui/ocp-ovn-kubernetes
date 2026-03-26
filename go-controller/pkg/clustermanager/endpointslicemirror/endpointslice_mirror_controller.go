@@ -124,8 +124,13 @@ func NewController(
 		networkManager: networkManager,
 	}
 
+	// Phase 1 Optimization: Use exponential backoff instead of fast/slow rate limiter
+	// FastSlowRateLimiter switches to 5s delay after only 5 failures, which is too aggressive
+	// Exponential backoff: 100ms → 200ms → 400ms → 800ms → ... → 30s max
+	baseDelay := 100 * time.Millisecond
+	maxDelay := 30 * time.Second
 	c.queue = workqueue.NewTypedRateLimitingQueueWithConfig(
-		workqueue.NewTypedItemFastSlowRateLimiter[string](1*time.Second, 5*time.Second, 5),
+		workqueue.NewTypedItemExponentialFailureRateLimiter[string](baseDelay, maxDelay),
 		workqueue.TypedRateLimitingQueueConfig[string]{Name: c.name},
 	)
 
@@ -247,28 +252,8 @@ func (c *Controller) syncDefaultEndpointSlice(ctx context.Context, key string) e
 		return err
 	}
 
-	namespacePrimaryNetwork, err := c.networkManager.GetActiveNetworkForNamespace(namespace)
-	if err != nil {
-		return err
-	}
-
-	if namespacePrimaryNetwork == nil || namespacePrimaryNetwork.IsDefault() || !namespacePrimaryNetwork.IsPrimaryNetwork() {
-		return nil
-	}
-
-	klog.Infof("Processing %s/%s EndpointSlice in %q primary network", namespace, name, namespacePrimaryNetwork.GetNetworkName())
-
-	nadKey, err := c.networkManager.GetPrimaryNADForNamespace(namespace)
-	if err != nil {
-		return err
-	}
-	if nadKey == types.DefaultNetworkName {
-		return fmt.Errorf("no primary NAD found for namespace %s", namespace)
-	}
-	if networkName := c.networkManager.GetNetworkNameForNADKey(nadKey); networkName == "" || networkName != namespacePrimaryNetwork.GetNetworkName() {
-		return fmt.Errorf("primary NAD %s does not match network %s", nadKey, namespacePrimaryNetwork.GetNetworkName())
-	}
-
+	// Phase 1 Optimization: Get EndpointSlices first (fast cache lookups)
+	// before expensive network manager calls
 	defaultEndpointSlice, err := c.endpointSliceLister.EndpointSlices(namespace).Get(name)
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
@@ -300,6 +285,41 @@ func (c *Controller) syncDefaultEndpointSlice(ctx context.Context, key string) e
 		return fmt.Errorf("found and removed %d mirrored EndpointSlices for %s/%s", len(slices), namespace, name)
 	}
 
+	// Phase 1 Optimization: Early exit check BEFORE expensive network manager calls
+	// Skip processing if we already reconciled this exact EndpointSlice (resourceVersion matches)
+	if defaultEndpointSlice != nil && mirroredEndpointSlice != nil {
+		if mirroredResourceVersion, ok := mirroredEndpointSlice.Annotations[types.LabelSourceEndpointSliceVersion]; ok {
+			if mirroredResourceVersion == defaultEndpointSlice.ResourceVersion {
+				klog.V(5).Infof("EndpointSlice %s/%s already reconciled (resourceVersion=%s), skipping",
+					namespace, name, defaultEndpointSlice.ResourceVersion)
+				return nil
+			}
+		}
+	}
+
+	// Now perform expensive network manager calls (only if resourceVersion changed or new slice)
+	namespacePrimaryNetwork, err := c.networkManager.GetActiveNetworkForNamespace(namespace)
+	if err != nil {
+		return err
+	}
+
+	if namespacePrimaryNetwork == nil || namespacePrimaryNetwork.IsDefault() || !namespacePrimaryNetwork.IsPrimaryNetwork() {
+		return nil
+	}
+
+	klog.Infof("Processing %s/%s EndpointSlice in %q primary network", namespace, name, namespacePrimaryNetwork.GetNetworkName())
+
+	nadKey, err := c.networkManager.GetPrimaryNADForNamespace(namespace)
+	if err != nil {
+		return err
+	}
+	if nadKey == types.DefaultNetworkName {
+		return fmt.Errorf("no primary NAD found for namespace %s", namespace)
+	}
+	if networkName := c.networkManager.GetNetworkNameForNADKey(nadKey); networkName == "" || networkName != namespacePrimaryNetwork.GetNetworkName() {
+		return fmt.Errorf("primary NAD %s does not match network %s", nadKey, namespacePrimaryNetwork.GetNetworkName())
+	}
+
 	if defaultEndpointSlice == nil {
 		if mirroredEndpointSlice != nil {
 			klog.Infof("The default EndpointSlice %s/%s no longer exists, removing the mirrored one: %s", namespace, mirroredEndpointSlice.Annotations[types.SourceEndpointSliceAnnotation], cache.MetaObjectToName(mirroredEndpointSlice))
@@ -316,15 +336,6 @@ func (c *Controller) syncDefaultEndpointSlice(ctx context.Context, key string) e
 			return c.kubeClient.DiscoveryV1().EndpointSlices(namespace).Delete(ctx, mirroredEndpointSlice.Name, metav1.DeleteOptions{})
 		}
 		return nil
-	}
-
-	if mirroredEndpointSlice != nil {
-		// nothing to do if we already reconciled this exact EndpointSlice
-		if mirroredResourceVersion, ok := mirroredEndpointSlice.Annotations[types.LabelSourceEndpointSliceVersion]; ok {
-			if mirroredResourceVersion == defaultEndpointSlice.ResourceVersion {
-				return nil
-			}
-		}
 	}
 
 	currentMirror, err := c.mirrorEndpointSlice(mirroredEndpointSlice, defaultEndpointSlice, namespacePrimaryNetwork, nadKey)
@@ -400,23 +411,29 @@ func (c *Controller) getPodIP(name, namespace, nadKey string, isIPv6 bool) (stri
 // mirrorEndpointSlice creates or updates a mirrored EndpointSlice based on the provided defaultEndpointSlice.
 // The mirrored EndpointSlice will have custom labels set and will be managed by the current controller.
 func (c *Controller) mirrorEndpointSlice(mirroredEndpointSlice, defaultEndpointSlice *v1.EndpointSlice, network util.NetInfo, nadKey string) (*v1.EndpointSlice, error) {
+	// Phase 1 Optimization: Avoid expensive DeepCopy, create new object with only needed fields
 	var currentMirror *v1.EndpointSlice
 	if mirroredEndpointSlice != nil {
-		currentMirror = mirroredEndpointSlice.DeepCopy()
-	}
-	if currentMirror == nil {
+		// Update case: create new object with selective fields instead of DeepCopy
+		currentMirror = &v1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            mirroredEndpointSlice.Name,
+				Namespace:       mirroredEndpointSlice.Namespace,
+				OwnerReferences: defaultEndpointSlice.OwnerReferences,
+				Labels:          make(map[string]string),
+				Annotations:     make(map[string]string),
+			},
+		}
+	} else {
+		// Create case: new object
 		currentMirror = &v1.EndpointSlice{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:       defaultEndpointSlice.Namespace,
 				OwnerReferences: defaultEndpointSlice.OwnerReferences,
+				Labels:          make(map[string]string),
+				Annotations:     make(map[string]string),
 			},
 		}
-	}
-	if currentMirror.Labels == nil {
-		currentMirror.Labels = map[string]string{}
-	}
-	if currentMirror.Annotations == nil {
-		currentMirror.Annotations = make(map[string]string)
 	}
 	currentMirror.AddressType = defaultEndpointSlice.AddressType
 	currentMirror.Ports = defaultEndpointSlice.Ports
@@ -445,9 +462,18 @@ func (c *Controller) mirrorEndpointSlice(mirroredEndpointSlice, defaultEndpointS
 			if err != nil {
 				return nil, fmt.Errorf("failed to determine the Pod IP of: %s/%s: %v", endpoint.TargetRef.Namespace, endpoint.TargetRef.Name, err)
 			}
-			newEp := endpoint.DeepCopy()
-			newEp.Addresses = []string{podIP}
-			currentMirror.Endpoints[i] = *newEp
+			// Phase 1 Optimization: Selective field copy instead of expensive DeepCopy
+			newEp := v1.Endpoint{
+				Addresses:          []string{podIP},
+				Conditions:         endpoint.Conditions,
+				Hostname:           endpoint.Hostname,
+				TargetRef:          endpoint.TargetRef,
+				DeprecatedTopology: endpoint.DeprecatedTopology,
+				NodeName:           endpoint.NodeName,
+				Zone:               endpoint.Zone,
+				Hints:              endpoint.Hints,
+			}
+			currentMirror.Endpoints[i] = newEp
 		}
 	}
 	return currentMirror, nil
