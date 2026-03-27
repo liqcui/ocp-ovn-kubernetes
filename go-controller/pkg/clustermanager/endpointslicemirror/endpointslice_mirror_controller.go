@@ -290,7 +290,7 @@ func (c *Controller) syncDefaultEndpointSlice(ctx context.Context, key string) e
 	if defaultEndpointSlice != nil && mirroredEndpointSlice != nil {
 		if mirroredResourceVersion, ok := mirroredEndpointSlice.Annotations[types.LabelSourceEndpointSliceVersion]; ok {
 			if mirroredResourceVersion == defaultEndpointSlice.ResourceVersion {
-				klog.V(5).Infof("EndpointSlice %s/%s already reconciled (resourceVersion=%s), skipping",
+				klog.V(4).Infof("EndpointSlice %s/%s already reconciled (resourceVersion=%s), skipping",
 					namespace, name, defaultEndpointSlice.ResourceVersion)
 				return nil
 			}
