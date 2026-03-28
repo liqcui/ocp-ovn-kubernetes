@@ -419,6 +419,8 @@ func (c *Controller) mirrorEndpointSlice(mirroredEndpointSlice, defaultEndpointS
 			ObjectMeta: metav1.ObjectMeta{
 				Name:            mirroredEndpointSlice.Name,
 				Namespace:       mirroredEndpointSlice.Namespace,
+				ResourceVersion: mirroredEndpointSlice.ResourceVersion, // Required for K8s optimistic locking
+				UID:             mirroredEndpointSlice.UID,             // Preserve object identity
 				OwnerReferences: defaultEndpointSlice.OwnerReferences,
 				Labels:          make(map[string]string),
 				Annotations:     make(map[string]string),
