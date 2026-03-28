@@ -7,7 +7,6 @@ import (
 	"github.com/google/uuid"
 
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog/v2"
 
 	libovsdbclient "github.com/ovn-kubernetes/libovsdb/client"
 
@@ -94,69 +93,12 @@ func DeleteChassis(sbClient libovsdbclient.Client, chassis ...*sbdb.Chassis) err
 		opModels = append(opModels, opModel...)
 	}
 
-	// Deduplicate IGMP_Group deletions to prevent constraint violations
-	opModels = deduplicateIGMPGroupDeletions(opModels)
-
 	m := newModelClient(sbClient)
 	err := m.Delete(opModels...)
 	return err
 }
 
 type chassisPredicate func(*sbdb.Chassis) bool
-
-// deduplicateIGMPGroupDeletions ensures that when deleting chassis, we don't
-// create duplicate IGMP_Group entries with identical (address, datapath, chassis) values.
-// When multiple chassis are deleted, their IGMP_Group entries may have the same
-// address and datapath but different chassis references. When chassis is set to nil,
-// this violates the database unique constraint on (address, datapath, chassis).
-//
-// This function deduplicates IGMP_Group deletion operations to prevent constraint
-// violations that cause transaction failures and forced recomputes.
-//
-// Root cause: IPv6 solicited-node multicast addresses (ff02::1:ff*) are shared
-// by pods with different interfaces on the same chassis and datapath.
-func deduplicateIGMPGroupDeletions(opModels []operationModel) []operationModel {
-	seen := make(map[string]bool)
-	filtered := make([]operationModel, 0, len(opModels))
-	duplicateCount := 0
-
-	for _, opModel := range opModels {
-		// Only deduplicate IGMP_Group delete operations
-		group, isIGMPGroup := opModel.Model.(*sbdb.IGMPGroup)
-		if !isIGMPGroup || opModel.ModelPredicate == nil {
-			// Keep all non-IGMP operations and IGMP operations without predicates
-			filtered = append(filtered, opModel)
-			continue
-		}
-
-		// Create unique key matching the database unique index: address|datapath|chassis
-		// Note: We use empty string for nil chassis since after deletion chassis will be nil
-		chassisKey := ""
-		if group.Chassis != nil {
-			chassisKey = *group.Chassis
-		}
-		datapathKey := ""
-		if group.Datapath != nil {
-			datapathKey = *group.Datapath
-		}
-		key := fmt.Sprintf("%s|%s|%s", group.Address, datapathKey, chassisKey)
-
-		if !seen[key] {
-			filtered = append(filtered, opModel)
-			seen[key] = true
-			klog.V(5).Infof("Including IGMP_Group deletion for key: %s", key)
-		} else {
-			duplicateCount++
-			klog.V(5).Infof("Skipping duplicate IGMP_Group deletion for key: %s", key)
-		}
-	}
-
-	if duplicateCount > 0 {
-		klog.V(4).Infof("Deduplicated %d IGMP_Group deletion operations to prevent constraint violations", duplicateCount)
-	}
-
-	return filtered
-}
 
 // DeleteChassisWithPredicate looks up chassis from the cache based on a given
 // predicate and deletes them as well as the associated private chassis
@@ -193,10 +135,6 @@ func DeleteChassisWithPredicate(sbClient libovsdbclient.Client, p chassisPredica
 			BulkOp:         true,
 		},
 	}
-
-	// Deduplicate IGMP_Group deletions to prevent constraint violations
-	opModels = deduplicateIGMPGroupDeletions(opModels)
-
 	m := newModelClient(sbClient)
 	err := m.Delete(opModels...)
 	return err
